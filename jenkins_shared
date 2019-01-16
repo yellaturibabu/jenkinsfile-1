@@ -1,0 +1,442 @@
+@Library('pipeline-shared') _
+groovylibraryname {}
+-----------
+src/org/props/ propsfile.groovy
+
+package pd.props
+class propsfile {
+   static final VARIABLE = 'VALUE';
+}
+-----------
+
+groovy file
+
+
+------------
+
+#!/usr/bin/env groovy
+
+//importing shared properties file pipeline-shared/src/pd/props/ooprops.groovy
+import org.props.propsfile
+
+//call function block, which calls the below pipeline script.
+def call(body) {
+    def config = [:]
+    body.resolveStrategy = Closure.DELEGATE_FIRST
+    body.delegate = config
+    body()
+
+    //jenkins pipeline declarative pipeline script starts from here.
+    pipeline {
+        agent {label ''}
+        environment {
+            //all the environment variables and * can be mentioned here to use below.
+            cred = *("${ooprops.cred}")
+            PROD_BRANCH = 'develop'
+            READY_TO_DEPLOY_ENV = ''
+        }
+        options {
+            //Jenkins Build Options.
+            timestamps()
+            skipDefaultCheckout()
+            buildDiscarder(logRotator(daysToKeepStr: '30', numToKeepStr: '30'))
+        }
+        stages {
+            stage('Checkout') {
+                //checkout of GitHub Repo Starts here.
+                steps {
+                    checkout scm
+                    script {
+                        //Props are downloaded from the import class mentioned above.
+						props = 'value'
+                        //project specific Properties are described in the Jenkinsfile.properties file this properties will override the existing properties.
+                        if (fileExists('Jenkinsfile.properties')) {
+                            echo 'Override props according to Jenkinsfile.properties '
+                            props = readProperties file: 'Jenkinsfile.properties'
+                            if(props['CF_ORG']){cf_org = props['CF_ORG']}
+                            if(props['CF_DEV_SPACE']){cf_dev_space = props['CF_DEV_SPACE']}
+                            if(props['CF_QA_SPACE']){cf_qa_space = props['CF_QA_SPACE']}
+                            if(props['CF_RC_SPACE']){cf_rc_space = props['CF_RC_SPACE']}
+                            if(props['SUCCESS_EMAIL_TO']){successEmailTo = props['SUCCESS_EMAIL_TO']}
+                            if(props['FAILED_EMAIL_TO']){failedEmailTo = props['FAILED_EMAIL_TO']}
+                            if(props['TARGET_EXT']){targetExt = props['TARGET_EXT']}
+                            if(props['DEPLOY_CONF']){deployConf = props['DEPLOY_CONF']}
+                            if(props['ARTIFACTORY_SPACE']){artifactorySpace = props['ARTIFACTORY_SPACE']}
+                            if(props['JMETER_JOB_NAME']){JMETER_JOB_NAME = props['JMETER_JOB_NAME']}
+                            if(props['DOMAIN']){
+                                cfRoutes = props['DOMAIN']
+                                
+                                if("${cfRoutes}" == "RUN"){
+                                    echo "********** This Pipeline Is Using manifest-int.yml Files If They Are Present **********"
+                                }   
+                            }
+                        } else {
+                        
+                            echo "********** This Pipeline Is Using manifest.yml Files **********"
+                            echo 'Jenkinsfile.properties does not exists'
+                        }
+
+                        //app name and app version is took from build.gradle file.
+                        propsinfo = readProperties file: 'build.gradle'
+                        appName = propsinfo['baseName']
+                        appName = appName.replaceAll("\'","");
+                        artifactoryPattern = "${appName}" + '*' + '.' + "${targetExt}" //'pd-what-if-simulator-service*.jar'
+                        artifactoryArtifactPath = "${appName}"  //'pd-what-if-simulator-service'
+
+                        //stash dev env specific manifest files
+                        stash name: "deploy-manifest-files", includes: "${deployConf}/*"
+                        //Conditional step to let jenkins know what type of job we are going for.
+                        if(params.CustomEnv){
+                            branchName = params.BranchName
+                            currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName + ':' + params.CustomEnv
+                            READY_TO_DEPLOY_ENV = params.CustomEnv
+                        }else{
+                            branchName = env.BRANCH_NAME ? env.BRANCH_NAME : PROD_BRANCH
+                            currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName
+                            READY_TO_DEPLOY_ENV = 'dev'
+                        }
+                        TIMEDOUT = ''
+                        ABORTED = ''
+                        TIMEDOUT1 = ''
+                        ABORTED1 = ''
+                        PROMOTE = ''
+                     
+                    }
+                }
+            }
+
+            stage ('Gradle Artifactory Config') {
+                //Gradle Artifactory variables are determined here.
+                steps {
+                    script {
+                        echo "${params.TargetEnv}"
+                        rtGradle = Artifactory.newGradleBuild()
+                        server = Artifactory.server('OOv2')
+                        buildInfo = Artifactory.newBuildInfo()
+                        rtGradle.deployer server: server, repo: '${artifactorySpace}'
+                        rtGradle.usesPlugin = true
+                        rtGradle.useWrapper = true
+                        rtGradle.deployer.deployArtifacts = true
+                        rtGradle.deployer.artifactDeploymentPatterns.addInclude(artifactoryPattern)
+                    }
+                }
+            }
+            stage ('Config Build Info') {
+                steps{
+                    script{
+                        buildInfo.env.capture = true
+                        buildInfo.env.filter.addInclude("*")
+                    }
+                }
+            }
+            stage ('Gradle Build') {
+                steps{
+                    script{
+                        //Gradle Build Starts Here.
+                        sh 'pwd'
+                        sh 'chmod 777 gradlew '
+                        sh 'ls -l'
+                        sh "cp -f gradle-propel.properties gradle.properties"  //getting gradle properties from gradle.properties file.
+                        rtGradle.run rootDir: ".", buildFile: 'build.gradle', tasks: '--no-daemon clean build ' //This Gradle Build command line Step.
+                    }
+                }
+                post {
+                    success{
+                        script {
+                            stash includes: 'build/libs/*.jar', name: 'artifact' //Storing built artifact for later use in pipeline.
+                        }
+                    }
+                    failure {echo "No Jar files to stash ${e}"} //throw error if it cant stash artifact.
+                }
+            }
+            stage('SonarQube Analysis') {
+                steps{
+                    script{
+                        withSonarQubeEnv(sonarEnv) {
+                            echo "About to Run Sonar"
+                            sh './gradlew --build-file build.gradle --info sonarqube' //Sonarqube Analysis
+                        }
+                    }
+                }
+                post{
+                    success{
+                        echo "Sonar Analysis done successfully"
+                        publishReport();     //Publish Html Reports of the build, This Function is described in the bottom of the pipeline.
+                    }
+                    failure{echo "Sonar Failed"}
+                }
+            }
+
+/*
+* Email notification method to notify each deployment stage
+*/
+
+def emailNotificationBuild(String ENV, String email, String current_result) {
+    echo "Email"
+    emailext to: email,
+            mimeType: 'text/html',
+            subject: "Build Status for ${ENV} : ${current_result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+            body: '${JELLY_SCRIPT,template="static-analysis"}',
+            attachLog: true
+}
+// Deploy Function.
+def Object deployBuildToEnv(String ENV, String cf_end_point, String cf_org, String cf_space, String deployConf, String cf_*_id_usr, String cf_*_id_psw) {
+
+    node('predixci-jdk-1.8') {
+        // Deploy artifact into environment ENV
+        echo "***stage: Deploy to ENV : ${ENV}***"
+        //unstash artifact that was being previosuly stashed
+        unstash 'artifact'
+        //unstash dev specific manifest files
+        unstash 'deploy-manifest-files'
+
+        sh 'pwd'
+        sh 'ls -l'
+        sh "cf login -a ${cf_end_point} -u ${cf_*_id_usr} -p ${cf_*_id_psw} -o ${cf_org} -s ${cf_space}"
+        
+        if("${cfRoutes}" == "RUN"){
+            if(fileExists("${deployConf}" + '/manifest-int-' + "${ENV}" + '.yml')){
+                echo "Using manifest-int-${ENV}.yml file"
+                sh "cf push -f ./${deployConf}/manifest-int-${ENV}.yml"
+            } else{
+                echo "Using manifest-${ENV}.yml file"
+                sh "cf push -f ./${deployConf}/manifest-${ENV}.yml"
+            }
+        }else{
+            echo "Using manifest-${ENV}.yml file"
+            sh "cf push -f ./${deployConf}/manifest-${ENV}.yml"
+        }
+        sh "cf a"
+    }
+}
+
+
+
+/*
+* Email notification method to notify who promoted and what promoted.
+*/
+
+def emailNotificationPromote(String ENV, String email, String whoDunnit) {
+    stage('Email Notification') {
+        mail body: "Promotion build url is here: ${env.BUILD_URL}  \n " +
+                "---------------------------------------------------------------- \n" +
+                "Summary: SUCCESS\n" +
+                "BUILD ID: ${env.BUILD_ID} " +
+                "${env.JOB_NAME} promoted to environment ${ENV} by ${whoDunnit}\n" +
+                "\n" +
+                "----------------------------------------------------------------",
+                subject: "Promote Status for ${ENV} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+                to: email
+    }
+}
+
+//Publish Html Reports Fuction.
+def publishReport() {
+    stage('Publish SCA Reports') {
+        step([$class: 'CheckStylePublisher', pattern: '**/checkstyle-results.xml,**/checkstyle-test-results.xml'])
+        step([$class: 'FindBugsPublisher', pattern: '**/findbugs-results.xml,**/findbugs-test-results.xml'])
+        step([$class: 'PmdPublisher', pattern: '**/pmd-results.xml,**/pmd-test-results.xml'])
+        step([$class: 'JUnitResultArchiver', testResults: '**/build/test-results/TEST-*.xml'])
+        step([$class: 'JacocoPublisher', execPattern: 'build/jacoco/**.exec', classPattern: 'build/classes', sourcePattern: 'src/main/java', inclusionPattern: '', exclusionPattern: '**/test/**/*.class,**/boot/**/*.class,**/dto/**/*.class,**/utils/**/*.class'])
+    }
+}
+
+
+-------------------------------
+
+Jenkins dev maven
+
+
+
+                        //Conditional step to let jenkins know what type of job we are going for.
+                        if(params.CustomEnv){
+                            branchName = params.BranchName
+                            currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName + ':' + params.CustomEnv
+                            READY_TO_DEPLOY_ENV = params.CustomEnv
+                        }else{
+                            branchName = env.BRANCH_NAME ? env.BRANCH_NAME : PROD_BRANCH
+                            currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName
+                            READY_TO_DEPLOY_ENV = 'dev'
+                        }
+                        TIMEDOUT = ''
+                        ABORTED = ''
+                        TIMEDOUT1 = ''
+                        ABORTED1 = ''
+                        PROMOTE = ''
+
+                    }
+
+                    echo sh(returnStdout: true, script: 'env')
+                }
+            }
+
+            stage('Build') {
+                steps {
+                    script {
+                        env.CurrentStage = "Build"
+                    }
+                    sh 'mvn --version'
+                    sh 'mvn -B clean install -s menlo_settings.xml -DskipTests -Djenkins.BUILD_TAG="$BUILD_TAG" -Djenkins.BUILD_ID="$BUILD_ID" -Djenkins.BUILD_NUMBER="$BUILD_NUMBER"'
+                    stash name: 'artifact', includes: 'target/*'
+                }
+                post {
+                    success { echo "$env.CurrentStage completed" }
+                    failure { echo "$env.CurrentStage failed" }
+                }
+            }
+
+            stage('Unit Tests') {
+                steps {
+                    script { env.CurrentStage = "Unit Tests" }
+                    sh 'mvn -B -s menlo_settings.xml -Dmaven.test.failure.ignore test'
+                }
+            }
+
+            stage('Surefire Report') {
+                steps {
+                    script { env.CurrentStage = "Surefire Report" }
+                    sh 'mvn -B -s menlo_settings.xml surefire-report:report-only'
+                }
+            }
+
+            stage('Java SCA') {
+                steps {
+                    script { env.CurrentStage = "Java SCA" }
+                    sh 'mvn -B -s menlo_settings.xml -e checkstyle:checkstyle pmd:pmd findbugs:findbugs'
+                }
+            }
+
+            stage('Sonar Scan') {
+                steps {
+                    script { env.CurrentStage = "Sonar Scan" }
+                    withSonarQubeEnv('SONAR') {
+                        sh 'mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.2:sonar -s menlo_settings.xml -Djenkins.BUILD_TAG="$BUILD_TAG" -Djenkins.BUILD_ID="$BUILD_ID" -Djenkins.BUILD_NUMBER="$BUILD_NUMBER"'
+                    }
+                }
+            }
+
+def Object deployBuildToEnv(String cf_end_point, String cf_*_id_usr, String cf_*_id_psw, String cf_org, String cf_space, String ENV, String deployConf) {
+    unstash 'deploy-manifest-files'
+    unstash 'artifact'
+    sh "cp ./${deployConf}/manifest-${ENV}.yml ./manifest.yml"
+
+
+    sh "cf login -a ${cf_end_point} -u ${cf_*_id_usr} -p ${cf_*_id_psw} -o ${cf_org} -s ${cf_space}"
+    sh "cf push"
+    sh 'cf a'
+
+}
+
+
+def emailNotification(String email) {
+    emailext to: email,
+            mimeType: 'text/html',
+            subject: "[${currentBuild.currentResult}: ${env.repoName}] - Build ${currentBuild.displayName} on Branch",
+            body: '${JELLY_SCRIPT,template="static-analysis"}',
+            attachLog: true
+}
+
+def emailNotificationPromote(String ENV, String email, String whoDunnit) {
+    stage('Email Notification') {
+        mail body: "Promotion build url is here: ${env.BUILD_URL}  \n " +
+                "---------------------------------------------------------------- \n" +
+                "Summary: SUCCESS\n" +
+                "BUILD ID: ${env.BUILD_ID} " +
+                "${env.JOB_NAME} promoted to environment ${ENV} by ${whoDunnit}\n" +
+                "\n" +
+                "----------------------------------------------------------------",
+                subject: "Promote Status for ${ENV} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+                to: email
+    }
+}
+
+/*
+* Email notification method to notify each deployment stage
+*/
+
+def emailNotificationBuild(String ENV, String email, String current_result) {
+    echo "Email"
+    emailext to: email,
+            mimeType: 'text/html',
+            subject: "Build Status for ${ENV} : ${current_result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+            body: '${JELLY_SCRIPT,template="static-analysis"}',
+            attachLog: true
+}
+
+
+
+------Jenkins Dev node
+
+
+stage('Setting Up npm'){
+                steps{
+                    script{
+                        echo "installing dependencies"
+                        sh 'ls -lrt'
+                        sh 'npm config set strict-ssl false'
+                        sh 'jspm config strictSSL false'
+                        sh 'node --version'
+                        sh 'npm --version'
+                        sh 'npm install'
+                        sh 'bower --version'
+                        sh 'bower install --allow-root --force-latest'
+                    }
+                }
+            }
+
+            stage('Setting Up jspm'){
+                steps{
+                    script{
+                        sh 'jspm config registries.github.remote https://github.jspm.io'
+                        sh 'jspm config registries.
+                        sh 'jspm config registries.github.maxRepoSize 100'
+                        sh 'jspm config registries.github.handler jspm-github'
+                        sh 'jspm config registries.
+                        sh 'jspm config registries.
+
+                        sh 'jspm config registries.
+                        sh 'jspm config registries.ge.maxRepoSize 100'
+                        sh 'jspm config registries.ge.handler jspm-github'
+
+                        echo 'Setup jspm config'
+                        sh 'jspm config registries.ge.timeouts.lookup 600'
+                        sh 'jspm config registries.github.tts.lookup 600'
+
+                        echo 'Install jspm'
+
+                        sh 'jspm install'
+                        sh 'ls -la'
+
+                    }
+                }
+            }
+
+            stage('Running tests'){
+                steps{
+                    script{
+                        echo "Tests"
+                        sh 'gulp test:unit'
+                        sh 'gulp lint'
+
+                    }
+                }
+            }
+
+            stage('Build Distribution and Zip File'){
+                steps{
+                    script{
+
+                        sh 'gulp sass'
+                        sh 'gulp dist'
+                        sh 'cd dist'
+                        sh 'ls -lrt'
+                        sh 'cd ..'
+                        sh "rm -rf ${artifactoryArtifactPath}"
+                        //sh 'gulp clean'
+                        //sh 'gulp build'
+                        sh 'ls -la'
+                        sh 'gulp createZip'
+
+                        echo 'Stash artifact'
+
+                        stash includes: "${artifactoryPattern}", name: 'artifact'
