@@ -1,0 +1,685 @@
+#!/usr/bin/env groovy
+
+import groovy.transform.Field
+
+def DEV = 'DEV'
+def QA = 'QA'
+def RC = 'RC'
+def PREPROD = 'PREPROD'
+def PROD = 'PROD'
+
+// placeholder for custom environment - can be 1,2,3,4,5
+// default set to undefined
+// if this is set, it means it is custom branch.
+// in custom branch, we currently don't want promotion,
+// only do deployment to custom environment and end pipeline
+def TargetEnv
+
+// branch name of custom build, else 'develop'
+// in custom build, this will be overridden with passed parameter from JOB
+def brName
+
+// by default, always develop branch of JMeter repo
+// in custom build, this will be overridden with passed parameter from JOB
+def JMeterBranch = 'develop'
+
+// placeholder variable to hold changing stages as pipeline moves from one stage to next
+def currentStage = 'Before Build Start'
+
+// placeholder variable to hold changing CF spaces as pipeline moves from one deploy stage to next
+def cfSpace = ''
+
+//microservice URL to be used
+//in custom build, this will be different
+//in develop build, it will point to the corresponding service in manifest files.
+@Field def adminServiceURL = ''
+
+@Field def cfDevSubstring = ''
+
+// hash-map implementation to hold key value pairs from properties files
+@Field def props = [:]
+
+@Field def microServiceName = ''
+
+@Field def artifactoryArtifactPath = ''
+@Field def artifactoryPattern = ''
+
+// shared variables
+@Field def deployConf = ''
+
+@Field def cfEndpoint = ''
+
+@Field def devOrg = ''
+@Field def qaOrg = ''
+@Field def rcOrg = ''
+@Field def preprodOrg = ''
+@Field def prodOrg = ''
+
+@Field def devSpace = ''
+@Field def qaSpace = ''
+@Field def rcSpace = ''
+@Field def preprodSpace = ''
+@Field def prodSpace = ''
+
+@Field def devSpaceCred = ''
+@Field def qaSpaceCred = ''
+@Field def rcSpaceCred = ''
+@Field def preprodSpaceCred = ''
+@Field def prodSpaceCred = ''
+
+@Field def successEmailTo = ''
+@Field def failedEmailTo = ''
+
+// Code text constants
+@Field def CF_SPACE_TEXT = "CF_SPACE"
+@Field def CF_ORG_TEXT = "CF_ORG"
+@Field def CF_CREDENTIALS_ID_TEXT = "CF_CREDENTIALS_ID"
+@Field def DEPLOY_CONF_TEXT = "DEPLOY_CONF"
+@Field def CF_END_POINT_TEXT = "CF_END_POINT"
+
+@Field def PROMOTE = 'promote'
+
+@Field def time = '7'
+@Field def timeUnit = 'DAYS'
+
+@Field def triggerAutomation = ''
+@Field def triggerSonar = ''
+
+@Field def enableProxy = 'false'
+@Field def routesAndBindings = 'new'
+
+@Field def sonarEnv = 'SONAR'
+@Field def jenkinsProperties = 'Jenkinsfile-propel-pipeline.properties'
+
+// Message constants
+
+// assigning default value to FAILED_EMAIL_TO properties just in case if the very first stage -
+// "checkout scm" fails and control is passed over to catch block.
+// props['FAILED_EMAIL_TO'] will be appropriately populated with the value in Jenkinsfile-pipeline.properties -
+// once checkout scm passes followed by readProperties succeeds reading all the properties
+props['FAILED_EMAIL_TO'] = ''
+
+def buildResult = "SUCCESS"
+
+try {
+
+    node("predixci-jdk-1.8") {
+
+        try {
+
+            brName = env.BranchName ? env.BranchName : 'develop'
+
+            JMeterBranch = env.JMeterBranch != null ? env.JMeterBranch : 'develop'
+
+            if (env.TargetEnv) {
+                TargetEnv = env.TargetEnv
+            }
+
+            if (env.jenkinsProperties) {
+                jenkinsProperties = env.jenkinsProperties
+            }
+            if (env.enableProxy) {
+                enableProxy = env.enableProxy
+            }
+
+            adminServiceURL = env.adminServiceURL
+
+            currentBuild.result = "SUCCESS"
+
+            currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + brName + (TargetEnv != null ? ':DEV' + TargetEnv : '')
+
+            // def build = currentBuild.rawBuild
+            echo '-*-*-*-*-*-*-*--*-*-*-*-*-*-*-*-*-*-*-'
+            // echo "User: " + userName
+            echo brName
+            echo JMeterBranch
+            echo 'Admin Service URL binding'
+            echo adminServiceURL
+            echo 'TargetEnv' + TargetEnv + '.'
+            echo currentBuild.displayName
+            echo '-*-*-*-*-*-*-*--*-*-*-*-*-*-*-*-*-*-*-'
+
+
+            currentStage = 'Setup proxies in-case of jenkins2'
+            stage('Setup proxies') {
+                // check if there are is job parameter as jenkins2 else treat it as propel !
+                // Jenkins 2 needs proxy
+                // propel doesn't need proxy
+                if (enableProxy == 'true') {
+                    sh 'export PROXY URL'
+                }
+
+            }
+
+            currentStage = 'Checkout'
+            stage('Checkout') {
+                echo 'Pulling out Branch name ' + brName
+                checkout scm
+
+                // read key-value pairs from properties file
+                // check if there are is job parameter as jenkins2 else treat it as propel !
+                props = readProperties file: jenkinsProperties
+//                if (jenkinsProperties == 'jenkins2') {
+//
+//                } else {
+//                    props = readProperties file: 'Jenkinsfile-propel-pipeline.properties'
+//                }
+
+
+                artifactoryPattern = props['ARTIFACTORY_PATTERN'].trim()
+                artifactoryArtifactPath = props['ARTIFACTORY_ARTIFACT_PATH'].trim()
+
+                microServiceName = props['MICRO_SERVICE_NAME'].trim()
+
+                deployConf = props['DEPLOY_CONF'].trim()
+                cfDevSubstring = props['CF_APP_NAME_DEV_SUBSTRING'].trim()
+
+
+                props['JMETER_JOB_NAME'] = props['JMETER_JOB_NAME'].trim()
+                props['JMETER_JOB_CUSTOM_BRANCH'] = props['JMETER_JOB_CUSTOM_BRANCH'].trim()
+
+
+                cfEndpoint = props['CF_END_POINT'].trim()
+
+                // CF Orgs
+                devOrg = props['CF_DEV_ORG'].trim()
+                qaOrg = props['CF_QA_ORG'].trim()
+                rcOrg = props['CF_RC_ORG'].trim()
+                preprodOrg = props['CF_PREPROD_ORG'].trim()
+                prodOrg = props['CF_PROD_ORG'].trim()
+
+                // CF Spaces
+                devSpace = props['CF_DEV_SPACE'].trim()
+                qaSpace = props['CF_QA_SPACE'].trim()
+                rcSpace = props['CF_RC_SPACE'].trim()
+                preprodSpace = props['CF_PREPROD_SPACE'].trim()
+                prodSpace = props['CF_PROD_SPACE'].trim()
+
+                // CF Cred
+
+                devSpaceCred = props['CF_DEV_SPACE_CREDENTIALS_ID'].trim()
+                qaSpaceCred = props['CF_QA_SPACE_CREDENTIALS_ID'].trim()
+                rcSpaceCred = props['CF_RC_SPACE_CREDENTIALS_ID'].trim()
+                preprodSpaceCred = props['CF_PREPROD_SPACE_CREDENTIALS_ID'].trim()
+                prodSpaceCred = props['CF_PROD_SPACE_CREDENTIALS_ID'].trim()
+
+
+                successEmailTo = props['SUCCESS_EMAIL_TO'].trim()
+                failedEmailTo = props['FAILED_EMAIL_TO'].trim()
+
+                time = props['TIME'].trim()
+                timeUnit = props['TIME_UNIT'].trim()
+
+                triggerAutomation = props['TRIGGER_AUTOMATION'].trim()
+                triggerSonar = props['TRIGGER_SONAR'].trim()
+
+                sonarEnv = props['SONAR_ENV'].trim()
+                if (env.sonarEnv) {
+                    sonarEnv = env.sonarEnv
+                }
+                routesAndBindings = props['ROUTES_BINDINGS'].trim()
+                if (env.routesAndBindings) {
+                    routesAndBindings = env.routesAndBindings
+                }
+
+                // in custom branch, we currently don't want promotion,
+                // only do deployment to custom environment and end pipeline
+                if (TargetEnv) {
+                    // stash dev env specific manifest files
+                    stash name: "deploy-conf-${TargetEnv}", includes: "${deployConf}/envs/${TargetEnv}/*"
+                } else {
+                    //stash dev env specific manifest files
+                    stash name: "deploy-conf-DEV", includes: "${deployConf}/envs/${DEV}/*"
+
+                    //stash qa env specific manifest files
+                    stash name: "deploy-conf-QA", includes: "${deployConf}/envs/${QA}/*"
+
+                    //stash rc env specific manifest files
+                    stash name: "deploy-conf-RC", includes: "${deployConf}/envs/${RC}/*"
+
+                    //stash pre-prod env specific manifest files
+                    stash name: "deploy-conf-PREPROD", includes: "${deployConf}/envs/${PREPROD}/*"
+
+                    //stash prod env specific manifest files
+                    stash name: "deploy-conf-PROD", includes: "${deployConf}/envs/${PROD}/*"
+                }
+            }
+
+            def rtGradle = Artifactory.newGradleBuild()
+            def server = Artifactory.server('OOv2')
+            def buildInfo = Artifactory.newBuildInfo()
+
+            currentStage = 'Gradle Artifactory Config'
+            stage('Gradle Artifactory Config') {
+                rtGradle.deployer server: server, repo: 'LDCZD-SNAPSHOT'
+                rtGradle.usesPlugin = true
+                rtGradle.useWrapper = true
+                rtGradle.deployer.deployArtifacts = true
+                rtGradle.deployer.artifactDeploymentPatterns.addInclude(artifactoryPattern)
+            }
+
+
+            currentStage = 'Config Build Info'
+            stage('Config Build Info') {
+                buildInfo.env.capture = true
+                buildInfo.env.filter.addInclude("*")
+            }
+
+            currentStage = 'Gradle Build'
+            stage('Gradle Build') {
+
+                sh 'pwd'
+                sh 'chmod 777 gradlew '
+                sh 'ls -l'
+
+                if (enableProxy == 'false') {
+                    sh "cp -f gradle-propel.properties gradle.properties"
+                }
+                rtGradle.run rootDir: ".", buildFile: 'build.gradle', tasks: '--no-daemon clean build '
+
+
+                try {
+                    stash includes: 'build/libs/*.jar', name: 'artifact'
+                } catch (Exception e) {
+                    echo "No Jar files to stash ${e}"
+                    throw new Exception('No Jar files to stash')
+                }
+
+
+            }
+
+
+            currentStage = 'SonarQube analysis'
+            if (triggerSonar == 'true') {
+
+                echo "About to run sonar"
+
+                stage('SonarQube analysis') {
+
+                    echo '***stage: SonarQube analysis***'
+                    try {
+
+                        withSonarQubeEnv(sonarEnv) {
+                            sh './gradlew --build-file build.gradle --info sonarqube'
+                        }
+
+                    } catch (Exception e) {
+                        echo "Sonar qube ${e}"
+                        throw new Exception(e)
+                    }
+                }
+                echo "Sonar completed"
+
+            }
+
+
+
+
+            currentStage = 'Publish artifacts to repo'
+            stage('Publish artifacts to repo') {
+                sh 'ls -l build/libs'
+                unstash 'artifact'
+
+                def uploadTarget
+
+                dir('build/libs') {
+
+                    if (TargetEnv) {
+                        uploadTarget = "ABCD-SNAPSHOT/${artifactoryArtifactPath}/custom/${env.BUILD_ID}/"
+                    } else {
+                        uploadTarget = "ABCD-SNAPSHOT/${artifactoryArtifactPath}/develop/${env.BUILD_ID}/"
+                    }
+
+                    echo "uploadtarget  ${uploadTarget}"
+
+                    def uploadSpec = """{
+                      "files": [
+                        {
+                          "pattern": "${artifactoryPattern}",
+                          "target": "${uploadTarget}" 
+                        }
+                      ]
+                    }"""
+
+                    try {
+                        server.upload(uploadSpec)
+                        server.publishBuildInfo buildInfo
+                    } catch (Exception e) {
+                        throw new Exception(currentStage)
+                    }
+                }
+            }
+
+        } catch (excptn) {
+            currentBuild.result = "FAILURE"
+            buildResult = "FAILURE"
+            //emailNotificationBuild("BUILD", failedEmailTo);
+            echo "Caught: ${excptn}"
+        } finally {
+            publishReport();
+            if (buildResult == "FAILURE") {
+                currentBuild.result = "FAILURE"
+            }
+        }
+    }
+
+    echo 'done building now trying to deploy'
+
+    if (currentBuild.result == "FAILURE") {
+        throw new Exception('BUILD Failed')
+    }
+
+    def propsEnv = [:]
+
+    if (TargetEnv) {
+        currentStage = 'CUSTOM BRANCH, NO PIPELINE JUST 1 DEPLOY TO CUSTOM ENV'
+        echo 'CUSTOM BRANCH, NO PIPELINE JUST 1 DEPLOY TO CUSTOM ENV'
+        //THIS IS CUSTOM BRANCH, NO PIPELINE JUST 1 DEPLOY TO CUSTOM ENV
+        //we're still pushing in DEV space only.
+
+        propsEnv[CF_SPACE_TEXT] = devSpace
+        propsEnv[CF_ORG_TEXT] = devOrg
+        propsEnv[CF_CREDENTIALS_ID_TEXT] = devSpaceCred
+
+        propsEnv[DEPLOY_CONF_TEXT] = deployConf
+        propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+        propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+        deployBuildToEnv(propsEnv, TargetEnv, routesAndBindings)
+
+        // Successfully deployed artifact into DEV environment. Send notification.
+        emailNotificationBuild("${DEV}${TargetEnv}", successEmailTo)
+
+        if (JMeterBranch != '') {
+            triggerJMeterJob(TargetEnv, triggerAutomation)
+        }
+
+    } else {
+        currentStage = 'DEFAULT JOB PIPELINE'
+        echo 'DEFAULT JOB PIPELINE'
+
+        //cloud foundry default space : dev
+        //building and deploying to dev first.
+        propsEnv[CF_SPACE_TEXT] = devSpace
+        propsEnv[CF_ORG_TEXT] = devOrg
+        propsEnv[CF_CREDENTIALS_ID_TEXT] = devSpaceCred
+
+        propsEnv[DEPLOY_CONF_TEXT] = deployConf
+        propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+        propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+        deployBuildToEnv(propsEnv, DEV, routesAndBindings)
+
+        // Successfully deployed artifact into DEV environment. Send notification.
+        emailNotificationBuild(DEV, successEmailTo)
+
+
+        triggerJMeterJob(DEV, triggerAutomation)
+
+        //switching to the cloud foundry qa space
+        //promoting to qa next.
+        // Request approval from user to deploy artifact into QA environment
+        // Best practices : "user input" should not be wrappd in any node
+        def approval = waitForApproval(QA, time, timeUnit)
+        if (approval[PROMOTE]) {
+
+            propsEnv[CF_SPACE_TEXT] = qaSpace
+            propsEnv[CF_ORG_TEXT] = qaOrg
+
+            propsEnv[CF_CREDENTIALS_ID_TEXT] = qaSpaceCred
+
+            propsEnv[DEPLOY_CONF_TEXT] = deployConf
+            propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+            propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+            deployBuildToEnv(propsEnv, QA, routesAndBindings)
+
+            // Successfully deployed artifact into QA environment. Send notification.
+            emailNotificationPromote(QA, successEmailTo, approval['approver']);
+            triggerJMeterJob(QA, triggerAutomation)
+        } else {
+            throw new Exception('SKIPPED')
+        }
+
+        //switching to the cloud foundry rc space
+        //promoting to rc next.
+        // Request approval from user to deploy artifact into RC environment
+        // Best practices : "user input" should not be wrappd in any node
+        approval = waitForApproval(RC, time, timeUnit)
+        if (approval[PROMOTE]) {
+            propsEnv[CF_SPACE_TEXT] = rcSpace
+            propsEnv[CF_ORG_TEXT] = rcOrg
+            propsEnv[CF_CREDENTIALS_ID_TEXT] = rcSpaceCred
+
+            propsEnv[DEPLOY_CONF_TEXT] = deployConf
+            propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+            propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+            deployBuildToEnv(propsEnv, RC, routesAndBindings)
+
+            // Successfully deployed artifact into RC environment. Send notification.
+            emailNotificationPromote(RC, successEmailTo, approval['approver']);
+            triggerJMeterJob(RC, triggerAutomation)
+
+        } else {
+            throw new Exception('SKIPPED')
+        }
+        /**
+         //switching to the cloud foundry preprod space
+         //promoting to preprod next.
+         // Request approval from user to deploy artifact into PREPROD environment
+         // Best practices : "user input" should not be wrappd in any node
+         approval = waitForApproval(PREPROD, time, timeUnit)
+         if (approval[PROMOTE]) {propsEnv[CF_SPACE_TEXT] = preprodSpace
+         propsEnv[CF_ORG_TEXT] = preprodOrg
+         propsEnv[CF_CREDENTIALS_ID_TEXT] = preprodSpaceCred
+
+         propsEnv[DEPLOY_CONF_TEXT] = deployConf
+         propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+         propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+         deployBuildToEnv(propsEnv, PREPROD, routesAndBindings)
+
+         // Successfully deployed artifact into PREPROD environment. Send notification.
+         emailNotificationPromote(PREPROD, successEmailTo, approval['approver']);
+         triggerJMeterJob(PREPROD, triggerAutomation)} else {throw new Exception('SKIPPED')}/**** DISABLING PREPROD AND PROD STAGES UNTIL WE GET ORG AND SPACES
+         //promoting to prod last.
+         // Request approval from user to deploy artifact into PROD environment
+         // Best practices : "user input" should not be wrappd in any node
+         approval = waitForApproval(PROD, time, timeUnit)
+         if (approval[PROMOTE]) {propsEnv[CF_SPACE_TEXT] = prodSpace
+         propsEnv[CF_ORG_TEXT] = prodOrg
+         propsEnv[CF_CREDENTIALS_ID_TEXT] = prodSpaceCred
+
+         propsEnv[DEPLOY_CONF_TEXT] = deployConf
+         propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+         propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+         deployBuildToEnv(propsEnv, PROD, routesAndBindings)
+
+         // Successfully deployed artifact into PROD environment. Send notification.
+         emailNotificationPromote(PROD, successEmailTo, approval['approver']);
+         triggerJMeterJob(PROD , triggerAutomation)} else {throw new Exception('SKIPPED')}**/
+    }
+    currentBuild.result = "SUCCESS"
+
+} catch (exc) {
+    if (exc.message == 'SKIPPED') {
+        //we intentionally threw this exception
+        currentBuild.result = 'SUCCESS'
+    } else {
+
+        // catch exception and send notification
+        currentBuild.result = 'FAILURE'
+        emailNotificationBuild(cfSpace, successEmailTo);
+        // display information on console
+        echo "Error: ${env.JOB_NAME} - Build#${env.BUILD_NUMBER} - FAILURE (Stage: ${currentStage} - ${exc.message})!"
+        // bail out. STOP!
+        error("Error: ${env.JOB_NAME} - Build#${env.BUILD_NUMBER} - FAILURE (Stage: ${currentStage} - ${exc.message})!");
+    }
+}
+
+
+def Object deployBuildToEnv(propsEnv, env, routesAndBindings) {
+    if (isInStdPipeline(env)) {
+        currentStage = 'Deploy-' + env
+    } else {
+        currentStage = 'Deploy Custom '
+    }
+
+    node('predixci-jdk-1.8') {
+        // Deploy artifact into environment env
+        stage(currentStage) {
+            echo "***stage: Deploy to ${env}***"
+            //unstash artifact that was being previosuly stashed
+            unstash 'artifact'
+            //unstash dev specific manifest files
+            unstash 'deploy-conf-' + env
+
+            sh 'ls -alh'
+            sh 'ls -alh ./deploy_conf/envs'
+
+            //deploy artifacts to cloud foundry
+            withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: propsEnv['CF_CREDENTIALS_ID'], usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+                sh 'echo uname=$USERNAME pwd=$PASSWORD'
+                cf_deploy(propsEnv['CF_END_POINT'], USERNAME, PASSWORD, propsEnv['CF_ORG'], propsEnv['CF_SPACE'], propsEnv['DEPLOY_CONF'], env, routesAndBindings, propsEnv['CF_APP_NAME_DEV_SUBSTRING'])
+            }
+        }
+    }
+}
+
+def Boolean triggerJMeterJob(env, triggerAutomation) {
+    def JMETER_JOB = props['JMETER_JOB_NAME']
+    def JMETER_JOB_CUSTOM_BRANCH = props['JMETER_JOB_CUSTOM_BRANCH']
+    if (isInStdPipeline(env)) {
+        currentStage = 'Trigger JMeter Job-' + env
+    } else {
+        currentStage = 'Trigger JMeter Job Custom'
+    }
+
+    stage(currentStage) {
+        if (triggerAutomation == 'true') {
+            if (isInStdPipeline(env)) {
+                build job: JMETER_JOB, parameters: [string(name: 'branch', value: "develop"), string(name: 'targetEnv', value: "${env}")], wait: false
+            } else {
+                build job: JMETER_JOB_CUSTOM_BRANCH, parameters: [string(name: 'branch', value: "${JMeterBranch}"), string(name: 'targetEnv', value: "${env}")], wait: false
+            }
+        }
+    }
+}
+
+/*
+* Login to Cloud Foundry and target an Org and Space
+* Push artifact to target
+*/
+
+def cf_deploy(String cfEndpoint, String userName, String password, String org, String space, String deployConf, String env, String routesAndBindings, cfDevSubstring) {
+    sh "cf login -a ${cfEndpoint} -u ${userName} -p ${password} -o ${org} -s ${space}"
+
+    if (routesAndBindings == 'old' && isInterimPipeline(env)) {
+        sh "cf push -f ./${deployConf}/envs/${env}/manifest-int.yml"
+    } else {
+        sh "cf push -f ./${deployConf}/envs/${env}/manifest.yml"
+    }
+
+    if (!isInStdPipeline(env)) {
+        updateCustomApp(env, routesAndBindings, cfDevSubstring)
+    }
+    sh 'cf a'
+}
+
+/*
+ * Check for stage in pipeline.
+ */
+
+def Boolean isInStdPipeline(env) {
+    if (env && env in ['DEV', 'QA', 'RC', 'PREPROD', 'PROD']) {
+        return true
+    }
+    return false
+}
+
+def Boolean isInterimPipeline(env) {
+    if (env && env in ['DEV', '1', '2', '3', '4', '5','QA', 'RC']) {
+        return true
+    }
+    return false
+}
+
+def updateCustomApp(env, routesAndBindings, cfDevSubstring) {
+    currentStage = 'Update Custom App'
+
+    def app_name = ''
+
+    if (routesAndBindings != 'old' && isInterimPipeline(env)) {
+        app_name = cfDevSubstring + env + '-int'
+    } else {
+        app_name = cfDevSubstring + env
+    }
+
+    sh "cf set-env ${app_name} adminServiceUrl ${adminServiceURL}"
+    sh "cf restage ${app_name}"
+
+}
+
+/*
+* Request input from user to approve (or abort) deployment
+* Set timeout to a day or abort deployment
+*/
+
+private Object waitForApproval(env, time, timeUnit) {
+    stage("Promote to " + env) {
+        timeout(time: time.toInteger(), unit: timeUnit) {
+            def userInput = input(id: 'userInput',
+                    ok: 'Ok',
+                    message: 'Approve deployment to ' + env + '?',
+                    parameters: [[$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Select checkbox to deploy this build to ' + env, name: 'promote']],
+                    submitterParameter: 'approver'
+            )
+            return userInput
+        }
+    }
+}
+
+/*
+* Email notification method to notify each deployment stage
+* Currently used to notify users DEV deployment
+*/
+
+def emailNotificationBuild(String space, String email) {
+    space = space.toUpperCase();
+    // use node that already has email server configured
+    node('predixci-node6-ubuntu') {
+        emailext to: email,
+                mimeType: 'text/html',
+                //subject: "Build Status for ${space}: ${currentBuild.result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+                subject: "[${currentBuild.result}:${microServiceName}] ${currentBuild.displayName}",
+                // subject: "[${currentBuild.result}:pd-contract-management-service] ${currentBuild.displayName}",
+                body: '${JELLY_SCRIPT,template="static-analysis"}',
+                attachLog: true
+    }
+}
+
+/*
+* Email notification method to notify each deployment stage
+* Currently used to notify users after QA, RC, PREPROD, PROD deployment
+*/
+
+def emailNotificationPromote(String envr, String email, String whoDunnit) {
+    stage('Email Notification') {
+        mail body: "Promotion build url is here: ${env.BUILD_URL}  \n " +
+                "---------------------------------------------------------------- \n" +
+                "Summary: SUCCESS\n" +
+                "BUILD ID: ${env.BUILD_ID} " +
+                "${env.JOB_NAME} promoted to environment ${envr} by ${whoDunnit}\n" +
+                "\n" +
+                "----------------------------------------------------------------",
+                subject: "Promote Status for ${envr}: ${currentBuild.result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+                to: email
+    }
+}
+
+
+def publishReport() {
+    stage('Publish Reports') {
+        step([$class: 'CheckStylePublisher', pattern: '**/checkstyle-results.xml,**/checkstyle-test-results.xml'])
+        step([$class: 'FindBugsPublisher', pattern: '**/findbugs-results.xml,**/findbugs-test-results.xml'])
+        step([$class: 'PmdPublisher', pattern: '**/pmd-results.xml,**/pmd-test-results.xml'])
+        step([$class: 'JUnitResultArchiver', testResults: '**/build/test-results/TEST-*.xml'])
+        step([$class: 'JacocoPublisher', execPattern: 'build/jacoco/**.exec', classPattern: 'build/classes', sourcePattern: 'src/main/java', inclusionPattern: '', exclusionPattern: '**/test/**/*.class,**/boot/**/*.class,**/dto/**/*.class,**/utils/**/*.class'])
+    }
+}
