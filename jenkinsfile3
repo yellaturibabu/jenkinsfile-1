@@ -1,0 +1,259 @@
+def appVersion = ''
+def artifactorySpace1 = ''
+def artifactorySpace2 = ''
+def artDownloadServer = ''
+def artifactName = ''
+def artifactInfo = ''
+def branchName = ''
+def cf_credentials_id = ''
+def cf_end_point = ''
+def cf_org = ''
+def cf_preprod_space = ''
+def cf_prod_space = ''
+def deployConf = ''
+def failed_email_to = ''
+def git_credentials_id = ''
+def git_end_point = ''
+def props = [:]
+def repoName = ''
+def success_email_to = ''
+def target = ''
+def targetExt = ''
+def targetPrefix = ''
+
+def Object cfCups(String cf_end_point, String cf_credentials_id, String cf_org, String cf_space, String ENV, String deployConf, String serviceInstance) {
+	sh "cp ./${deployConf}/cups-${serviceInstance}-${ENV}.json ./cups-${serviceInstance}.json"
+	
+ withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: cf_credentials_id, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+ sh "cf login -a ${cf_end_point} -u ${USERNAME} -p ${PASSWORD} -o ${cf_org} -s ${cf_space}"
+ sh "cf cups ${serviceInstance} -p ./cups-${serviceInstance}.json"
+ 
+ }
+}
+
+def Object deployBuildToEnv(String cf_end_point, String cf_credentials_id, String cf_org, String cf_space, String ENV, String deployConf) {
+ sh "cp ./${deployConf}/manifest-${ENV}.yml ./manifest.yml"
+	
+ //deploy artifacts to cloud foundry
+ withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: cf_credentials_id, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+ //sh 'echo uname=${USERNAME} pwd=${PASSWORD}'
+ sh "cf login -a ${cf_end_point} -u ${USERNAME} -p ${PASSWORD} -o ${cf_org} -s ${cf_space}"
+ sh "cf push"
+ sh 'cf a'
+ 
+ }
+}
+
+def emailNotification(String email) {
+ echo "Email"
+ emailext to: email,
+ mimeType: 'text/html',
+ subject: "[${currentBuild.currentResult}: ${params.CF_SPACE}] - Build ${currentBuild.displayName} on Branch",
+ body: '${JELLY_SCRIPT,template="static-analysis"}',
+ attachLog: true
+}
+
+pipeline {
+ agent {label 'predixci-jdk-1.8'}
+ options {
+ timestamps()
+ skipDefaultCheckout()
+ buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '30', numToKeepStr: '30'))
+ }
+ 
+ stages {
+ stage('Checkout') {
+ steps {
+ checkout scm
+ script {
+	branchName = env.BRANCH_NAME ? env.BRANCH_NAME : 'develop'
+	currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName
+	env.CurrentStage = 'Checkout'
+	env.READY_TO_DEPLOY_ENV = 'preprod'
+ env.READY_TO_TEST_ENV = ''
+	env.PROD_BRANCH = 'develop'
+ props = readProperties file: 'Jenkinsfile.properties'
+ artifactorySpace1 = props['ARTIFACTORY_SPACE1']
+	artifactorySpace2 = props['ARTIFACTORY_SPACE2']
+	artDownloadServer = Artifactory.server(props['ARTIFACTORY_SERVER'])
+ deployConf = props['DEPLOY_CONF']
+	cf_credentials_id = props['CF_CREDENTIALS_ID']
+ cf_end_point = props['CF_END_POINT']
+ cf_org = props['CF_ORG']
+ cf_preprod_space = props['CF_PREPROD_SPACE']
+ cf_prod_space = props['CF_PROD_SPACE']
+	git_credentials_id = props['GIT_CREDENTIALS_ID']
+	git_end_point = props['GIT_END_POINT']
+	appName = props['MICRO_SERVICE_NAME']
+	appVersion = props['MICRO_SERVICE_VERSION']
+ failed_email_to = props['FAILED_EMAIL_TO']
+ success_email_to = props['SUCCESS_EMAIL_TO']
+	targetExt = props['TARGET_EXT']
+	targetPrefix = props['TARGET_PREFIX']
+
+ }
+
+ }
+ }
+
+
+ stage ('Download artifacts') {
+ steps {
+ script {
+	CurrentStage = "Download artifacts"
+ echo 'Download artifacts from Artifactory'
+	artifactName = appName + '-' + appVersion + '.' + targetExt
+ repoName = "${targetPrefix}${appName}/${branchName}/${params.BuildNumber}/${artifactName}"
+ downloadable = artifactorySpace1 + '/' + repoName
+	target = "./target/"
+ downloaded = target + repoName
+ deployable = target + artifactName	
+ echo "============= ${downloadable} =========="
+	
+	
+ def downloadSpec = """{
+ "files": [
+ {
+ "pattern": "${downloadable}",
+ "target": "${target}"
+ }
+ ]
+ }"""
+ artDownloadServer.download(downloadSpec)
+ sh "ls -l ${downloaded}"
+ sh "mv ${downloaded} ${target}"
+ sh "ls -l ${deployable}"
+ }
+ }
+ }
+ 
+ stage('Deploy to preprod') {
+ when { expression {return "${params.CF_SPACE}" != "${cf_prod_space}"}}
+ steps {
+	script {
+	env.CurrentStage = "Deploy to ${env.READY_TO_DEPLOY_ENV}"
+	echo "$env.CurrentStage"
+	deployBuildToEnv(cf_end_point, cf_credentials_id, cf_org, cf_preprod_space, env.READY_TO_DEPLOY_ENV, deployConf)
+ env.READY_TO_TEST_ENV = "${cf_preprod_space}"
+	}
+ }
+ }
+
+ stage('Smoke Test in preprod') {
+ when { expression {return "${env.READY_TO_TEST_ENV }" == "${cf_preprod_space}"}}
+ steps {
+ script {
+ env.CurrentStage = "Smoke Test in ${cf_preprod_space}"
+ echo "$env.CurrentStage goes here"
+	
+	}
+	}
+ post {
+ success {
+ script {
+ env.READY_TO_DEPLOY_ENV = 'prod'
+ echo "$env.CurrentStage completed and ready to deploy to ${env.READY_TO_DEPLOY_ENV}"
+ }
+ }
+ failure {echo "$env.CurrentStage failed"}
+ }
+ }
+	
+ stage('Deploy to prod') {
+ when { 
+ anyOf {
+ expression {return "${params.CF_SPACE}" != "${cf_preprod_space}"}
+ expression {return "${env.READY_TO_DEPLOY_ENV}" == "prod"}
+	}
+ }
+ steps {
+	script {
+	env.READY_TO_DEPLOY_ENV = 'prod'
+	env.CurrentStage = "Deploy to ${env.READY_TO_DEPLOY_ENV}"
+ echo "$env.CurrentStage"
+	deployBuildToEnv(cf_end_point, cf_credentials_id, cf_org, cf_prod_space, env.READY_TO_DEPLOY_ENV, deployConf)
+	env.READY_TO_TEST_ENV = "${cf_prod_space}"
+	}
+ }
+ }
+
+
+ stage('Smoke Test in prod') {
+ when { 
+ anyOf {
+ expression {return "${params.CF_SPACE}" != "${cf_preprod_space}"}
+ expression {return "${env.READY_TO_TEST_ENV}" == "prod"}
+	}
+ }
+ steps {
+ script {
+ env.CurrentStage = "Smoke Test in prod"
+ echo "$env.CurrentStage goes here"
+	}
+ }
+ post {
+ success {echo "$env.CurrentStage completed"}
+ failure {echo "$env.CurrentStage failed" }
+ }
+ }
+
+ }
+ post {
+ success {
+ script {
+ println("********* ${env.CurrentStage} ${currentBuild.currentResult} ************")
+	emailNotification(success_email_to)
+	}
+	}
+
+ failure { 
+ script {
+	println("********* ${env.CurrentStage} ${currentBuild.currentResult} ************")
+	//emailNotification(failed_email_to)
+	}
+ deleteDir()
+ }
+
+ }
+ 
+}
+
+Jenkinsfile-propel-pipeline.properties
+
+# Name of the micro-service you are attempting to deploy
+MICRO_SERVICE_NAME=pd-what-if-simulator-service
+# Name of the deploy directory in your source-code
+DEPLOY_CONF=deploy
+# CF end point target url
+CF_END_POINT=https://api.system.aws-usw02-pr.ice.predix.io
+# CF end point target dev org
+CF_DEV_ORG=PD-MnD
+CF_DEV_SPACE=oo-dev
+CF_QA_SPACE=oo-qa
+CF_RC_SPACE=oo-rc
+CF_PREPROD_SPACE=oo-preprod
+CF_PROD_SPACE=oo-prod
+CF_DEV_SPACE_CREDENTIALS_ID=b5e1c702-ae7d-44ae-965e-26e8d631273a
+SUCCESS_EMAIL_TO=
+
+# Email notification. Distribution list in case of failure deployment
+FAILED_EMAIL_TO=
+
+# Both success and failure distribution lists could be one and the same
+# Project specific configuration
+#file name
+ARTIFACTORY_PATTERN=pd-what-if-simulator-service*.jar
+# project name
+ARTIFACTORY_ARTIFACT_PATH=pd-what-if-simulator-service
+# Time in number
+TIME=7
+# Time units SECONDS MINUTES DAYS
+TIME_UNIT=DAYS
+TRIGGER_AUTOMATION=false
+# Sonar
+TRIGGER_SONAR=true
+# Sonar env name
+SONAR_ENV=SONAR
+
+# CF app name common sub part
+CF_APP_NAME_DEV_SUBSTRING=pd-what-if-simulator-service-dev-
