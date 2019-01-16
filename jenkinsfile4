@@ -1,0 +1,596 @@
+#!/usr/bin/env groovy
+
+import groovy.transform.Field
+
+def DEV = 'dev'
+def brName // branch name of custom build, else 'develop'
+def currentStage = 'Before Build Start'
+def cfSpace = ''
+
+//microservice URL to be used
+//in custom build, this will be different
+//in develop build, it will point to the corresponding service in manifest files.
+@Field def adminServiceURL = ''
+@Field def cfDevSubstring = ''
+
+// hash-map implementation to hold key value pairs from properties files
+@Field def props = [:]
+@Field def microServiceName = ''
+@Field def artifactoryArtifactPath = ''
+@Field def artifactoryPattern = ''
+
+// shared variables
+@Field def deployConf = ''
+@Field def cfEndpoint = ''
+@Field def devOrg = ''
+@Field def devSpace = ''
+@Field def devSpaceCred = ''
+@Field def successEmailTo = ''
+@Field def failedEmailTo = ''
+
+// Code text constants
+@Field def CF_SPACE_TEXT = "CF_SPACE"
+@Field def CF_ORG_TEXT = "CF_ORG"
+@Field def CF_CREDENTIALS_ID_TEXT = "CF_CREDENTIALS_ID"
+@Field def DEPLOY_CONF_TEXT = "DEPLOY_CONF"
+@Field def CF_END_POINT_TEXT = "CF_END_POINT"
+
+@Field def time = '7'
+@Field def timeUnit = 'DAYS'
+
+@Field def triggerAutomation = ''
+@Field def triggerSonar = ''
+
+@Field def sonarEnv = 'SONAR'
+@Field def jenkinsProperties = 'Jenkinsfile-propel-pipeline.properties'
+
+props['FAILED_EMAIL_TO'] = ''
+
+def buildResult = "SUCCESS"
+
+try {
+
+ node("predixci-jdk-1.8") {
+
+ try {
+
+ brName = env.BranchName ? env.BranchName : 'develop'
+
+ if (env.jenkinsProperties) {
+ jenkinsProperties = env.jenkinsProperties
+ }
+
+ adminServiceURL = env.adminServiceURL
+
+ currentBuild.result = "SUCCESS"
+ currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + brName
+
+ // def build = currentBuild.rawBuild
+ echo '-*-*-*-*-*-*-*--*-*-*-*-*-*-*-*-*-*-*-'
+ echo brName
+ echo 'Admin Service URL binding'
+ echo adminServiceURL
+ echo currentBuild.displayName
+ echo '-*-*-*-*-*-*-*--*-*-*-*-*-*-*-*-*-*-*-'
+
+ currentStage = 'Checkout'
+ stage('Checkout') {
+ echo 'Pulling out Branch name ' + brName
+ checkout scm
+
+ props = readProperties file: jenkinsProperties
+
+ artifactoryPattern = props['ARTIFACTORY_PATTERN'].trim()
+ artifactoryArtifactPath = props['ARTIFACTORY_ARTIFACT_PATH'].trim()
+
+ microServiceName = props['MICRO_SERVICE_NAME'].trim()
+
+ deployConf = props['DEPLOY_CONF'].trim()
+ cfDevSubstring = props['CF_APP_NAME_DEV_SUBSTRING'].trim()
+
+ cfEndpoint = props['CF_END_POINT'].trim()
+
+ // CF Orgs
+ devOrg = props['CF_DEV_ORG'].trim()
+
+ // CF Spaces
+ devSpace = props['CF_DEV_SPACE'].trim()
+
+ // CF Cred
+ devSpaceCred = props['CF_DEV_SPACE_CREDENTIALS_ID'].trim()
+
+ successEmailTo = props['SUCCESS_EMAIL_TO'].trim()
+ failedEmailTo = props['FAILED_EMAIL_TO'].trim()
+
+ time = props['TIME'].trim()
+ timeUnit = props['TIME_UNIT'].trim()
+
+ triggerAutomation = props['TRIGGER_AUTOMATION'].trim()
+ triggerSonar = props['TRIGGER_SONAR'].trim()
+
+ sonarEnv = props['SONAR_ENV'].trim()
+ if (env.sonarEnv) {
+ sonarEnv = env.sonarEnv
+ }
+ echo DEV
+ echo deployConf
+ sh 'pwd'
+ 
+ //stash dev env specific manifest files
+ stash name: "deploy-conf-dev", includes: "${deployConf}/*"
+ }
+
+ def rtGradle = Artifactory.newGradleBuild()
+ def server = Artifactory.server('OOv2')
+ def buildInfo = Artifactory.newBuildInfo()
+
+ currentStage = 'Gradle Artifactory Config'
+ stage('Gradle Artifactory Config') {
+ rtGradle.deployer server: server, repo: 'LDCZD-SNAPSHOT'
+ rtGradle.usesPlugin = true
+ rtGradle.useWrapper = true
+ rtGradle.deployer.deployArtifacts = true
+ rtGradle.deployer.artifactDeploymentPatterns.addInclude(artifactoryPattern)
+ }
+
+
+ currentStage = 'Config Build Info'
+ stage('Config Build Info') {
+ buildInfo.env.capture = true
+ buildInfo.env.filter.addInclude("*")
+ }
+
+ currentStage = 'Gradle Build'
+ stage('Gradle Build') {
+
+ sh 'pwd'
+ sh 'chmod 777 gradlew '
+ sh 'ls -l'
+
+ sh "cp -f gradle-propel.properties gradle.properties"
+ rtGradle.run rootDir: ".", buildFile: 'build.gradle', tasks: '--no-daemon clean build '
+
+ try {
+ stash includes: 'build/libs/*.jar', name: 'artifact'
+ } catch (Exception e) {
+ echo "No Jar files to stash ${e}"
+ throw new Exception('No Jar files to stash')
+ }
+ }
+
+
+ currentStage = 'SonarQube analysis'
+ if (triggerSonar == 'true') {
+
+ echo "About to run sonar"
+ stage('SonarQube analysis') {
+ echo '***stage: SonarQube analysis***'
+ try {
+ withSonarQubeEnv(sonarEnv) {
+ sh './gradlew --build-file build.gradle --info sonarqube'
+ }
+ } catch (Exception e) {
+ echo "Sonar qube ${e}"
+ throw new Exception(e)
+ }
+ }
+ echo "Sonar completed"
+ }
+
+ currentStage = 'Publish artifacts to repo'
+ stage('Publish artifacts to repo') {
+ sh 'ls -l build/libs'
+ unstash 'artifact'
+
+ def uploadTarget
+
+ dir('build/libs') {
+ uploadTarget = "ABCD-SNAPSHOT/${artifactoryArtifactPath}/develop/${env.BUILD_ID}/"
+
+ echo "uploadtarget ${uploadTarget}"
+
+ def uploadSpec = """{
+ "files": [
+ {
+ "pattern": "${artifactoryPattern}",
+ "target": "${uploadTarget}" 
+ }
+ ]
+ }"""
+
+ try {
+ server.upload(uploadSpec)
+ server.publishBuildInfo buildInfo
+ } catch (Exception e) {
+ throw new Exception(currentStage)
+ }
+ }
+ }
+
+ } catch (excptn) {
+ currentBuild.result = "FAILURE"
+ buildResult = "FAILURE"
+ //emailNotificationBuild("BUILD", failedEmailTo);
+ echo "Caught: ${excptn}"
+ } finally {
+ publishReport();
+ if (buildResult == "FAILURE") {
+ currentBuild.result = "FAILURE"
+ }
+ }
+ }
+
+ echo 'done building now trying to deploy'
+
+ if (currentBuild.result == "FAILURE") {
+ throw new Exception('BUILD Failed')
+ }
+
+ def propsEnv = [:]
+ currentStage = 'DEFAULT JOB PIPELINE'
+ echo 'DEFAULT JOB PIPELINE'
+
+ //cloud foundry default space : dev
+ //building and deploying to dev first.
+ propsEnv[CF_SPACE_TEXT] = devSpace
+ propsEnv[CF_ORG_TEXT] = devOrg
+ propsEnv[CF_CREDENTIALS_ID_TEXT] = devSpaceCred
+
+ propsEnv[DEPLOY_CONF_TEXT] = deployConf
+ propsEnv[CF_END_POINT_TEXT] = cfEndpoint
+ propsEnv['CF_APP_NAME_DEV_SUBSTRING'] = cfDevSubstring
+ deployBuildToEnv(propsEnv, DEV)
+
+ // Successfully deployed artifact into DEV environment. Send notification.
+ emailNotificationBuild(DEV, successEmailTo)
+
+ currentBuild.result = "SUCCESS"
+
+} catch (exc) {
+ if (exc.message == 'SKIPPED') {
+ //we intentionally threw this exception
+ currentBuild.result = 'SUCCESS'
+ } else {
+
+ // catch exception and send notification
+ currentBuild.result = 'FAILURE'
+ emailNotificationBuild(cfSpace, successEmailTo);
+ // display information on console
+ echo "Error: ${env.JOB_NAME} - Build#${env.BUILD_NUMBER} - FAILURE (Stage: ${currentStage} - ${exc.message})!"
+ // bail out. STOP!
+ error("Error: ${env.JOB_NAME} - Build#${env.BUILD_NUMBER} - FAILURE (Stage: ${currentStage} - ${exc.message})!");
+ }
+}
+
+def Object deployBuildToEnv(propsEnv, env) {
+ 
+ currentStage = 'Deploy-' + env
+ 
+ node('predixci-jdk-1.8') {
+ // Deploy artifact into environment env
+ stage(currentStage) {
+ echo "***stage: Deploy to ${env}***"
+ //unstash artifact that was being previosuly stashed
+ unstash 'artifact'
+ //unstash dev specific manifest files
+ unstash 'deploy-conf-' + env
+
+ sh 'ls -alh'
+ sh 'ls -alh ./deploy'
+
+ //deploy artifacts to cloud foundry
+ withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: propsEnv['CF_CREDENTIALS_ID'], usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+ sh 'echo uname=$USERNAME pwd=$PASSWORD'
+ cf_deploy(propsEnv['CF_END_POINT'], USERNAME, PASSWORD, propsEnv['CF_ORG'], propsEnv['CF_SPACE'], propsEnv['DEPLOY_CONF'], env, propsEnv['CF_APP_NAME_DEV_SUBSTRING'])
+ }
+ }
+ }
+}
+
+/*
+* Login to Cloud Foundry and target an Org and Space
+* Push artifact to target
+*/
+
+def cf_deploy(String cfEndpoint, String userName, String password, String org, String space, String deployConf, String env, String cfDevSubstring) {
+
+ sh "pwd"
+ sh "ls -l"
+ sh "cf login -a ${cfEndpoint} -u ${userName} -p ${password} -o ${org} -s ${space}"
+ sh "cf push -f ./${deployConf}/manifest-${env}.yml"
+ sh "cf a"
+}
+
+/*
+* Email notification method to notify each deployment stage
+* Currently used to notify users DEV deployment
+*/
+
+def emailNotificationBuild(String space, String email) {
+ space = space.toUpperCase();
+ // use node that already has email server configured
+ node('predixci-node6-ubuntu') {
+ emailext to: email,
+ mimeType: 'text/html',
+ //subject: "Build Status for ${space}: ${currentBuild.result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+ subject: "[${currentBuild.result}:${microServiceName}] ${currentBuild.displayName}",
+ // subject: "[${currentBuild.result}:pd-contract-management-service] ${currentBuild.displayName}",
+ body: '${JELLY_SCRIPT,template="static-analysis"}',
+ attachLog: true
+ }
+}
+
+/*
+* Email notification method to notify each deployment stage
+* Currently used to notify users after QA, RC, PREPROD, PROD deployment
+*/
+
+def emailNotificationPromote(String envr, String email, String whoDunnit) {
+ stage('Email Notification') {
+ mail body: "Promotion build url is here: ${env.BUILD_URL} \n " +
+ "---------------------------------------------------------------- \n" +
+ "Summary: SUCCESS\n" +
+ "BUILD ID: ${env.BUILD_ID} " +
+ "${env.JOB_NAME} promoted to environment ${envr} by ${whoDunnit}\n" +
+ "\n" +
+ "----------------------------------------------------------------",
+ subject: "Promote Status for ${envr}: ${currentBuild.result} || Job : '${env.JOB_NAME} [BUILD# ${env.BUILD_NUMBER}]'",
+ to: email
+ }
+}
+
+
+def publishReport() {
+ stage('Publish Reports') {
+ step([$class: 'CheckStylePublisher', pattern: '**/checkstyle-results.xml,**/checkstyle-test-results.xml'])
+ step([$class: 'FindBugsPublisher', pattern: '**/findbugs-results.xml,**/findbugs-test-results.xml'])
+ step([$class: 'PmdPublisher', pattern: '**/pmd-results.xml,**/pmd-test-results.xml'])
+ step([$class: 'JUnitResultArchiver', testResults: '**/build/test-results/TEST-*.xml'])
+ step([$class: 'JacocoPublisher', execPattern: 'build/jacoco/**.exec', classPattern: 'build/classes', sourcePattern: 'src/main/java', inclusionPattern: '', exclusionPattern: '**/test/**/*.class,**/boot/**/*.class,**/dto/**/*.class,**/utils/**/*.class'])
+ }
+}
+
+
+2.....This is jenkinsfile in standard format:
+ def appName = ''
+def appVersion = ''
+def artifactorySpace1 = ''
+def artifactorySpace2 = ''
+def artDownloadServer = ''
+def artifactName = ''
+def artifactInfo = ''
+def branchName = ''
+def cf_credentials_id = ''
+def cf_end_point = ''
+def cf_org = ''
+def cf_preprod_space = ''
+def cf_prod_space = ''
+def deployConf = ''
+def failed_email_to = ''
+def git_credentials_id = ''
+def git_end_point = ''
+def props = [:]
+def repoName = ''
+def success_email_to = ''
+def target = ''
+def targetExt = ''
+def targetPrefix = ''
+
+def Object cfCups(String cf_end_point, String cf_credentials_id, String cf_org, String cf_space, String ENV, String deployConf, String serviceInstance) {
+	sh "cp ./${deployConf}/cups-${serviceInstance}-${ENV}.json ./cups-${serviceInstance}.json"
+	
+ withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: cf_credentials_id, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+ sh "cf login -a ${cf_end_point} -u ${USERNAME} -p ${PASSWORD} -o ${cf_org} -s ${cf_space}"
+ sh "cf cups ${serviceInstance} -p ./cups-${serviceInstance}.json"
+ 
+ }
+}
+
+def Object deployBuildToEnv(String cf_end_point, String cf_credentials_id, String cf_org, String cf_space, String ENV, String deployConf) {
+ sh "cp ./${deployConf}/manifest-${ENV}.yml ./manifest.yml"
+	
+ //deploy artifacts to cloud foundry
+ withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: cf_credentials_id, usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]) {
+ //sh 'echo uname=${USERNAME} pwd=${PASSWORD}'
+ sh "cf login -a ${cf_end_point} -u ${USERNAME} -p ${PASSWORD} -o ${cf_org} -s ${cf_space}"
+ sh "cf push"
+ sh 'cf a'
+ 
+ }
+}
+
+def emailNotification(String email) {
+ echo "Email"
+ emailext to: email,
+ mimeType: 'text/html',
+ subject: "[${currentBuild.currentResult}: ${params.CF_SPACE}] - Build ${currentBuild.displayName} on Branch",
+ body: '${JELLY_SCRIPT,template="static-analysis"}',
+ attachLog: true
+}
+
+pipeline {
+ agent {label 'predixci-jdk-1.8'}
+ options {
+ timestamps()
+ skipDefaultCheckout()
+ buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '30', numToKeepStr: '30'))
+ }
+ 
+ stages {
+ stage('Checkout') {
+ steps {
+ checkout scm
+ script {
+	branchName = env.BRANCH_NAME ? env.BRANCH_NAME : 'develop'
+	currentBuild.displayName = '#' + env.BUILD_NUMBER + ':' + branchName
+	env.CurrentStage = 'Checkout'
+	env.READY_TO_DEPLOY_ENV = 'preprod'
+ env.READY_TO_TEST_ENV = ''
+	env.PROD_BRANCH = 'develop'
+ props = readProperties file: 'Jenkinsfile.properties'
+ artifactorySpace1 = props['ARTIFACTORY_SPACE1']
+	artifactorySpace2 = props['ARTIFACTORY_SPACE2']
+	artDownloadServer = Artifactory.server(props['ARTIFACTORY_SERVER'])
+ deployConf = props['DEPLOY_CONF']
+	cf_credentials_id = props['CF_CREDENTIALS_ID']
+ cf_end_point = props['CF_END_POINT']
+ cf_org = props['CF_ORG']
+ cf_preprod_space = props['CF_PREPROD_SPACE']
+ cf_prod_space = props['CF_PROD_SPACE']
+	git_credentials_id = props['GIT_CREDENTIALS_ID']
+	git_end_point = props['GIT_END_POINT']
+	appName = props['MICRO_SERVICE_NAME']
+	appVersion = props['MICRO_SERVICE_VERSION']
+ failed_email_to = props['FAILED_EMAIL_TO']
+ success_email_to = props['SUCCESS_EMAIL_TO']
+	targetExt = props['TARGET_EXT']
+	targetPrefix = props['TARGET_PREFIX']
+
+ }
+
+ }
+ }
+
+
+ stage ('Download artifacts') {
+ steps {
+ script {
+	CurrentStage = "Download artifacts"
+ echo 'Download artifacts from Artifactory'
+	artifactName = appName + '-' + appVersion + '.' + targetExt
+ repoName = "${targetPrefix}${appName}/${branchName}/${params.BuildNumber}/${artifactName}"
+ downloadable = artifactorySpace1 + '/' + repoName
+	target = "./target/"
+ downloaded = target + repoName
+ deployable = target + artifactName	
+ echo "============= ${downloadable} =========="
+	
+	
+ def downloadSpec = """{
+ "files": [
+ {
+ "pattern": "${downloadable}",
+ "target": "${target}"
+ }
+ ]
+ }"""
+ artDownloadServer.download(downloadSpec)
+ sh "ls -l ${downloaded}"
+ sh "mv ${downloaded} ${target}"
+ sh "ls -l ${deployable}"
+ }
+ }
+ }
+ 
+ stage('Deploy to preprod') {
+ when { expression {return "${params.CF_SPACE}" != "${cf_prod_space}"}}
+ steps {
+	script {
+	env.CurrentStage = "Deploy to ${env.READY_TO_DEPLOY_ENV}"
+	echo "$env.CurrentStage"
+	deployBuildToEnv(cf_end_point, cf_credentials_id, cf_org, cf_preprod_space, env.READY_TO_DEPLOY_ENV, deployConf)
+ env.READY_TO_TEST_ENV = "${cf_preprod_space}"
+	}
+ }
+ }
+
+ stage('Smoke Test in preprod') {
+ when { expression {return "${env.READY_TO_TEST_ENV }" == "${cf_preprod_space}"}}
+ steps {
+ script {
+ env.CurrentStage = "Smoke Test in ${cf_preprod_space}"
+ echo "$env.CurrentStage goes here"
+	
+	}
+	}
+ post {
+ success {
+ script {
+ env.READY_TO_DEPLOY_ENV = 'prod'
+ echo "$env.CurrentStage completed and ready to deploy to ${env.READY_TO_DEPLOY_ENV}"
+ }
+ }
+ failure {echo "$env.CurrentStage failed"}
+ }
+ }
+	
+ stage('Deploy to prod') {
+ when { 
+ anyOf {
+ expression {return "${params.CF_SPACE}" != "${cf_preprod_space}"}
+ expression {return "${env.READY_TO_DEPLOY_ENV}" == "prod"}
+	}
+ }
+ steps {
+	script {
+	env.READY_TO_DEPLOY_ENV = 'prod'
+	env.CurrentStage = "Deploy to ${env.READY_TO_DEPLOY_ENV}"
+ echo "$env.CurrentStage"
+	deployBuildToEnv(cf_end_point, cf_credentials_id, cf_org, cf_prod_space, env.READY_TO_DEPLOY_ENV, deployConf)
+	env.READY_TO_TEST_ENV = "${cf_prod_space}"
+	}
+ }
+ }
+
+
+ stage('Smoke Test in prod') {
+ when { 
+ anyOf {
+ expression {return "${params.CF_SPACE}" != "${cf_preprod_space}"}
+ expression {return "${env.READY_TO_TEST_ENV}" == "prod"}
+	}
+ }
+ steps {
+ script {
+ env.CurrentStage = "Smoke Test in prod"
+ echo "$env.CurrentStage goes here"
+	}
+ }
+ post {
+ success {echo "$env.CurrentStage completed"}
+ failure {echo "$env.CurrentStage failed" }
+ }
+ }
+
+ }
+ post {
+ success {
+ script {
+ println("********* ${env.CurrentStage} ${currentBuild.currentResult} ************")
+	emailNotification(success_email_to)
+	}
+	}
+
+ failure { 
+ script {
+	println("********* ${env.CurrentStage} ${currentBuild.currentResult} ************")
+	//emailNotification(failed_email_to)
+	}
+ deleteDir()
+ }
+
+ }
+ 
+}
+3. Jenkins Props file...
+Jenkins.properties file
+ARTIFACTORY_SPACE1=
+ARTIFACTORY_SPACE2=
+ARTIFACTORY_SERVER=devcloud
+CF_ORG=
+CF_DEV_SPACE=
+CF_QA_SPACE=
+CF_RC_SPACE=
+CF_PREPROD_SPACE=
+CF_PROD_SPACE=oo-prod
+CF_END_POINT=
+CF_CREDENTIALS_ID=
+DEPLOY_CONF=
+GIT_CREDENTIALS_ID=
+GIT_END_POINT=
+MICRO_SERVICE_NAME=
+MICRO_SERVICE_VERSION=
+TARGET_EXT=jar
+TARGET_PREFIX=
+SUCCESS_EMAIL_TO=
+FAILED_EMAIL_TO=
